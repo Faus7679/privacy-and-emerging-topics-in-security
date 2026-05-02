@@ -8,23 +8,50 @@ This script uses the OpenAI API to:
 
 Usage:
     Set the OPENAI_API_KEY environment variable before running:
-        export OPENAI_API_KEY="your-api-key-here"
+        PowerShell: $env:OPENAI_API_KEY="your-api-key-here"
+        bash/zsh: export OPENAI_API_KEY="your-api-key-here"
     Then run:
         python cleanup_downloads.py
 """
-
 import os
 import shutil
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
-from openai import OpenAI
+from openai import OpenAI 
 
 # ── Configuration ────────────────────────────────────────────────────────────
 DAYS_THRESHOLD = 60
 DOWNLOADS_FOLDER = Path.home() / "Downloads"
 DELETE_FOLDER = Path.home() / "delete"
+ENV_FILE = Path(__file__).with_name(".env")
+
+
+def load_api_key() -> str | None:
+    """Load OPENAI_API_KEY from the environment or a local .env file."""
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if api_key:
+        return api_key
+
+    if not ENV_FILE.exists():
+        return None
+
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+
+        key, value = stripped.split("=", 1)
+        if key.strip() != "OPENAI_API_KEY":
+            continue
+
+        api_key = value.strip().strip('"').strip("'")
+        if api_key:
+            os.environ["OPENAI_API_KEY"] = api_key
+            return api_key
+
+    return None
 
 
 def get_old_files(folder: Path, days: int) -> list[Path]:
@@ -54,8 +81,26 @@ def move_files_to_delete(files: list[Path], delete_folder: Path) -> list[str]:
     return moved
 
 
-def ask_openai(client: OpenAI, old_files: list[Path]) -> str:
+def build_fallback_advice(old_files: list[Path]) -> str:
+    """Return a local cleanup summary when the API is unavailable."""
+    if old_files:
+        return (
+            f"You are cleaning up {len(old_files)} older file(s) from Downloads and moving "
+            "them into the delete folder. Tip: review Downloads weekly and archive anything "
+            "important before deleting it."
+        )
+
+    return (
+        "Your Downloads folder does not contain files older than the threshold. Tip: keep "
+        "Downloads tidy by sorting or deleting files you no longer need."
+    )
+
+
+def ask_openai(client: OpenAI | None, old_files: list[Path]) -> str:
     """Ask ChatGPT to summarise the cleanup action and provide advice."""
+    if client is None:
+        return build_fallback_advice(old_files)
+
     if old_files:
         file_list = "\n".join(f"  - {f.name}" for f in old_files)
         user_message = (
@@ -72,33 +117,37 @@ def ask_openai(client: OpenAI, old_files: list[Path]) -> str:
             "about keeping a tidy Downloads folder."
         )
 
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a helpful assistant that advises on computer file management "
-                    "and security best practices. Keep responses concise."
-                ),
-            },
-            {"role": "user", "content": user_message},
-        ],
-        max_tokens=200,
-    )
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a helpful assistant that advises on computer file management "
+                        "and security best practices. Keep responses concise."
+                    ),
+                },
+                {"role": "user", "content": user_message},
+            ],
+            max_tokens=200,
+        )
+    except Exception:
+        return build_fallback_advice(old_files)
+
     return response.choices[0].message.content.strip()
 
 
 def main() -> None:
     # ── Validate environment ──────────────────────────────────────────────────
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = load_api_key()
     if not api_key:
-        raise EnvironmentError(
-            "OPENAI_API_KEY environment variable is not set. "
-            "Please set it before running this script."
+        print(
+            "OPENAI_API_KEY is not set. Continuing without API access and using a local "
+            "cleanup summary."
         )
 
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key) if api_key else None
 
     # ── Check Downloads folder ────────────────────────────────────────────────
     if not DOWNLOADS_FOLDER.exists():
